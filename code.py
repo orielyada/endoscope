@@ -291,8 +291,9 @@ while True:
                 tail
             )
 
-            # Send to host as HID INPUT report (32 bytes).
-            dev.send_report(in_buf)
+            # If running, send to host as HID INPUT report (32 bytes).
+            if running:
+                dev.send_report(in_buf)
 
         # 4) Low-rate heartbeat so you know code is alive + USB is connected.
         diag(f"alive t={time.monotonic():.1f} usb={supervisor.runtime.usb_connected}")
