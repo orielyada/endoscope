@@ -1,6 +1,20 @@
 import time
 import struct
 import usb_hid
+import supervisor
+
+DIAG = True
+_last_diag = 0.0
+
+def diag(msg, period_s=0.5):
+    global _last_diag
+    if not DIAG:
+        return
+    now = time.monotonic()
+    if now - _last_diag >= period_s:
+        _last_diag = now
+        print(msg)
+
 
 dev = None
 for d in usb_hid.devices:
@@ -114,6 +128,8 @@ while True:
             )
 
             dev.send_report(in_buf)
+
+        diag(f"alive t={time.monotonic():.1f} usb={supervisor.runtime.usb_connected}")
 
         time.sleep(0)
 

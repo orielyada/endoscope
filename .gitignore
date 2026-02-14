@@ -8,3 +8,5 @@ Thumbs.db
 
 # VS Code settings (optional)
 .vscode/
+
+*.mpy
