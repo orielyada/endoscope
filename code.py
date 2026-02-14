@@ -13,6 +13,174 @@ import time
 import struct
 import usb_hid
 import supervisor
+import board
+import digitalio
+import busio
+
+
+# --- Torso bus (STEMMA QT): SCL=board.SCL, SDA=board.SDA ---
+
+i2c_torso = busio.I2C(board.SCL, board.SDA)
+
+# --- Handset bus: D25=SCL, D24=SDA ---
+
+i2c_handset = busio.I2C(board.D25, board.D24)
+
+# -------- Expected I2C addresses (verified / from your scans + datasheets) --------
+ADDR_NAU7802 = 0x2A                 # fixed address :contentReference[oaicite:2]{index=2}
+ADDR_LSM6DSOX = 0x6A                # 0x6A or 0x6B depending on SA0/SDO; you scanned 0x6A :contentReference[oaicite:3]{index=3}
+
+ADDR_PCF8574 = 0x20                 # your handset scan showed 0x20 (typical base)
+ADDR_BNO085  = 0x4A                 # your handset scan showed 0x4A
+
+# -------- Cached presence flags (updated periodically) --------
+pcf_ok = False
+bno_ok = False
+lsm6_ok = False
+nau_ok = False
+
+_last_i2c_scan = 0.0
+
+def _scan_i2c_set(i2c, lock_timeout_s=0.05):
+    t0 = time.monotonic()
+    while not i2c.try_lock():
+        if time.monotonic() - t0 > lock_timeout_s:
+            raise RuntimeError("I2C lock timeout")
+    try:
+        return set(i2c.scan())
+    finally:
+        i2c.unlock()
+
+'''
+def update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0):
+    global _last_i2c_scan, pcf_ok, bno_ok, lsm6_ok, nau_ok
+
+    now = time.monotonic()
+    if now - _last_i2c_scan < period_s:
+        return
+    _last_i2c_scan = now
+
+    try:
+        addrs_t = _scan_i2c_set(i2c_torso)
+        nau_ok  = (ADDR_NAU7802 in addrs_t)
+        lsm6_ok = (ADDR_LSM6DSOX in addrs_t) or (0x6B in addrs_t)
+    except Exception:
+        nau_ok = False
+        lsm6_ok = False
+
+    try:
+        addrs_h = _scan_i2c_set(i2c_handset)
+        pcf_ok = (ADDR_PCF8574 in addrs_h)
+        bno_ok = (ADDR_BNO085  in addrs_h)
+    except Exception:
+        pcf_ok = False
+        bno_ok = False
+'''
+# Required I2C addresses (strict)
+ADDR_NAU7802 = 0x2A
+ADDR_LSM6DSOX = 0x6A     
+ADDR_PCF8574 = 0x20
+ADDR_BNO085  = 0x4A
+
+ALLOWED_TORSO   = {ADDR_NAU7802, ADDR_LSM6DSOX}
+ALLOWED_HANDSET = {ADDR_PCF8574, ADDR_BNO085}
+
+def update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0):
+    """Scan both buses ~1 Hz. Any 'extra junk' address on a bus => that bus fails."""
+    global _last_i2c_scan, pcf_ok, bno_ok, lsm6_ok, nau_ok
+
+    now = time.monotonic()
+    if now - _last_i2c_scan < period_s:
+        return
+    _last_i2c_scan = now
+
+    # Default to fail until proven otherwise
+    nau_ok = False
+    lsm6_ok = False
+    pcf_ok = False
+    bno_ok = False
+
+    # ---- Torso bus ----
+    try:
+        addrs_t = _scan_i2c_set(i2c_torso)
+
+        # If any address outside allowed set appears, treat as junk bus => fail both
+        if not addrs_t.issubset(ALLOWED_TORSO):
+            nau_ok = False
+            lsm6_ok = False
+        else:
+            nau_ok  = (ADDR_NAU7802 in addrs_t)
+            lsm6_ok = (ADDR_LSM6DSOX in addrs_t)
+    except Exception:
+        nau_ok = False
+        lsm6_ok = False
+
+    # ---- Handset bus ----
+    try:
+        addrs_h = _scan_i2c_set(i2c_handset)
+        print("handset scan:", [hex(a) for a in sorted(addrs_h)])
+
+
+        # Any address outside allowed set => junk bus => fail both
+        if not addrs_h.issubset(ALLOWED_HANDSET):
+            pcf_ok = False
+            bno_ok = False
+        else:
+            pcf_ok = (ADDR_PCF8574 in addrs_h)
+            bno_ok = (ADDR_BNO085  in addrs_h)
+    except Exception:
+        pcf_ok = False
+        bno_ok = False
+
+
+
+def make_status_bits(running_flag: bool) -> int:
+    status = 0
+    status |= (1 << 0)  # ready
+    status |= (1 << 1)  # init_ok
+
+    if running_flag:
+        status |= (1 << 2)  # running
+
+    # handset connected if at least one handset device is present
+    handset_connected = (pcf_ok or bno_ok)
+    if handset_connected:
+        status |= (1 << 3)
+
+    # device OK bits
+    if lsm6_ok: status |= (1 << 6)
+    if nau_ok:  status |= (1 << 7)
+    if bno_ok:  status |= (1 << 8)
+    if pcf_ok:  status |= (1 << 9)
+
+    # BIT passed only if all devices are OK and USB is connected
+    bit_passed = supervisor.runtime.usb_connected and lsm6_ok and nau_ok and bno_ok and pcf_ok
+    if bit_passed:
+        status |= (1 << 5)
+
+    return status
+
+
+
+'''
+# I2C test: scan for devices on both busses and print results.
+def scan_i2c(i2c, name):
+    while not i2c.try_lock():
+        pass
+    try:
+        print(name, [hex(a) for a in i2c.scan()])
+    finally:
+        i2c.unlock()
+
+print("Starting I2C scans...")
+scan_i2c(i2c_torso, "i2c_torso")
+scan_i2c(i2c_handset, "i2c_handset")
+print("Done I2C scans.")
+
+# stop here so it doesn't keep running your main program
+while True:
+    time.sleep(1)
+'''
 
 # -----------------------------
 # Debug / heartbeat printing
@@ -77,13 +245,14 @@ if dev is None:
 #   knob0/1:    H H   (4 bytes)    unsigned 16-bit
 #   slider0/1:  H H   (4 bytes)    unsigned 16-bit
 #   load16:     h     (2 bytes)    signed 16-bit
-#   roll16:     H     (2 bytes)    unsigned 16-bit (as you had it; keep)
+#   roll16:     h     (2 bytes)    signed 16-bit
 #   buttons:    H     (2 bytes)    bitfield
 #   status:     H     (2 bytes)    debug signature
 #   tail:       6s    (6 bytes)    magic + errcount + last OUT bytes
 #
 # Total = 2 + 8 + 4 + 4 + 2 + 2 + 2 + 2 + 6 = 32 bytes
-FMT_IN = "<HhhhhHHHHhHHH6s"
+FMT_IN = "<HhhhhHHHHhhHH6s"
+
 
 # Pre-allocated buffer to avoid heap churn at high rates.
 in_buf = bytearray(32)
@@ -253,6 +422,14 @@ while True:
         # 1) Poll host control packet (OUT report).
         poll_out_and_apply()
 
+        update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0)
+        status_bits = make_status_bits(running)
+        diag(f"flags lsm6={lsm6_ok} nau={nau_ok} bno={bno_ok} pcf={pcf_ok} status=0x{status_bits:04X}", period_s=1.0)
+
+        reserved = b"\x00" * 6
+
+
+
         # 2) Compute scheduling for periodic IN report sends.
         now_ns = time.monotonic_ns()
 
@@ -266,16 +443,6 @@ while True:
             # Sequence increments each report.
             seq = (seq + 1) & 0xFFFF
 
-            # Status signature shows whether we've applied START/STOP.
-            status = make_status(running)
-
-            # Tail: magic + errcount + last OUT payload (3 bytes).
-            tail = bytes((
-                magic,
-                errcount & 0xFF,
-                (errcount >> 8) & 0xFF,
-                out3[0], out3[1], out3[2],
-            ))
 
             # Pack the report into the 32-byte buffer.
             struct.pack_into(
@@ -287,8 +454,8 @@ while True:
                 load16,
                 roll16,
                 buttons,
-                status,
-                tail
+                status_bits,
+                reserved
             )
 
             # If running, send to host as HID INPUT report (32 bytes).
