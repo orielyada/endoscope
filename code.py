@@ -26,6 +26,59 @@ i2c_torso = busio.I2C(board.SCL, board.SDA)
 
 i2c_handset = busio.I2C(board.D25, board.D24)
 
+# --- PCF8574 on handset bus ---
+PCF_ADDR = 0x20
+
+# Debounce state for PCF P0..P7
+_pcf_last_raw = 0xFF          # last raw byte read (active-low typical, so idle high=1)
+_pcf_stable = 0xFF            # debounced stable raw
+_pcf_same_count = 0           # how many consecutive identical reads
+PCF_DEBOUNCE_SAMPLES = 3      # change accepted after N same samples
+
+def pcf_init(i2c):
+    """Put PCF8574 in 'input' mode by writing 1s to all pins."""
+    # Writing 1 configures pin as input (quasi-bidirectional). Buttons then pull low.
+    while not i2c.try_lock():
+        pass
+    try:
+        i2c.writeto(PCF_ADDR, bytes([0xFF]))
+    finally:
+        i2c.unlock()
+
+def pcf_read_raw(i2c) -> int:
+    """Read raw PCF8574 port byte (bit=1 means high)."""
+    buf = bytearray(1)
+    while not i2c.try_lock():
+        pass
+    try:
+        i2c.readfrom_into(PCF_ADDR, buf)
+    finally:
+        i2c.unlock()
+    return buf[0]
+
+def pcf_read_debounced(i2c) -> int:
+    """
+    Return debounced *raw* byte (still active-low).
+    Debounce based on consecutive identical reads.
+    """
+    global _pcf_last_raw, _pcf_stable, _pcf_same_count
+
+    raw = pcf_read_raw(i2c)
+
+    if raw == _pcf_last_raw:
+        if _pcf_same_count < 255:
+            _pcf_same_count += 1
+    else:
+        _pcf_last_raw = raw
+        _pcf_same_count = 0
+
+    # Accept change after N consistent samples
+    if _pcf_same_count >= (PCF_DEBOUNCE_SAMPLES - 1):
+        _pcf_stable = _pcf_last_raw
+
+    return _pcf_stable
+
+
 # -------- Expected I2C addresses (verified / from your scans + datasheets) --------
 ADDR_NAU7802 = 0x2A                 # fixed address :contentReference[oaicite:2]{index=2}
 ADDR_LSM6DSOX = 0x6A                # 0x6A or 0x6B depending on SA0/SDO; you scanned 0x6A :contentReference[oaicite:3]{index=3}
@@ -51,31 +104,7 @@ def _scan_i2c_set(i2c, lock_timeout_s=0.05):
     finally:
         i2c.unlock()
 
-'''
-def update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0):
-    global _last_i2c_scan, pcf_ok, bno_ok, lsm6_ok, nau_ok
 
-    now = time.monotonic()
-    if now - _last_i2c_scan < period_s:
-        return
-    _last_i2c_scan = now
-
-    try:
-        addrs_t = _scan_i2c_set(i2c_torso)
-        nau_ok  = (ADDR_NAU7802 in addrs_t)
-        lsm6_ok = (ADDR_LSM6DSOX in addrs_t) or (0x6B in addrs_t)
-    except Exception:
-        nau_ok = False
-        lsm6_ok = False
-
-    try:
-        addrs_h = _scan_i2c_set(i2c_handset)
-        pcf_ok = (ADDR_PCF8574 in addrs_h)
-        bno_ok = (ADDR_BNO085  in addrs_h)
-    except Exception:
-        pcf_ok = False
-        bno_ok = False
-'''
 # Required I2C addresses (strict)
 ADDR_NAU7802 = 0x2A
 ADDR_LSM6DSOX = 0x6A     
@@ -118,7 +147,6 @@ def update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0):
     # ---- Handset bus ----
     try:
         addrs_h = _scan_i2c_set(i2c_handset)
-        print("handset scan:", [hex(a) for a in sorted(addrs_h)])
 
 
         # Any address outside allowed set => junk bus => fail both
@@ -162,25 +190,6 @@ def make_status_bits(running_flag: bool) -> int:
 
 
 
-'''
-# I2C test: scan for devices on both busses and print results.
-def scan_i2c(i2c, name):
-    while not i2c.try_lock():
-        pass
-    try:
-        print(name, [hex(a) for a in i2c.scan()])
-    finally:
-        i2c.unlock()
-
-print("Starting I2C scans...")
-scan_i2c(i2c_torso, "i2c_torso")
-scan_i2c(i2c_handset, "i2c_handset")
-print("Done I2C scans.")
-
-# stop here so it doesn't keep running your main program
-while True:
-    time.sleep(1)
-'''
 
 # -----------------------------
 # Debug / heartbeat printing
@@ -414,6 +423,15 @@ def poll_out_and_apply() -> None:
 
 
 # -----------------------------
+# initialize devices
+# -----------------------------
+
+pcf_init(i2c_handset)
+
+
+
+
+# -----------------------------
 # Main loop
 # -----------------------------
 
@@ -424,9 +442,21 @@ while True:
 
         update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0)
         status_bits = make_status_bits(running)
+
         diag(f"flags lsm6={lsm6_ok} nau={nau_ok} bno={bno_ok} pcf={pcf_ok} status=0x{status_bits:04X}", period_s=1.0)
 
         reserved = b"\x00" * 6
+
+
+        # Read 8 handset buttons from PCF8574
+        pcf_raw = pcf_read_debounced(i2c_handset)
+
+        # Typical: pressed pulls low => invert so 1=pressed
+        pcf_pressed = (~pcf_raw) & 0xFF
+
+        # Map P0..P7 -> HID buttons bit0..bit7 (buttons 1..8)
+        # Map P0..P7 -> HID buttons bit0..bit7 (buttons 1..8)
+        buttons = (buttons & 0xFF00) | pcf_pressed
 
 
 
@@ -472,6 +502,9 @@ while True:
         # If anything goes wrong, don't crash the firmware.
         # Count errors and keep looping.
         errcount = (errcount + 1) & 0xFFFF
+
+        print("EXC:", repr(e))
+
 
         # Small delay prevents tight exception loops from starving USB.
         time.sleep(0.01)
