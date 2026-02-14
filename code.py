@@ -17,6 +17,20 @@ import board
 import digitalio
 import busio
 
+import digitalio
+import board
+
+pin_torso_l = digitalio.DigitalInOut(board.D10)
+pin_torso_l.switch_to_input(pull=digitalio.Pull.UP)
+
+pin_torso_r = digitalio.DigitalInOut(board.D9)
+pin_torso_r.switch_to_input(pull=digitalio.Pull.UP)
+
+pin_pedal = digitalio.DigitalInOut(board.D5)
+pin_pedal.switch_to_input(pull=digitalio.Pull.UP)
+
+pin_pedal_sense = digitalio.DigitalInOut(board.D6)
+pin_pedal_sense.switch_to_input(pull=digitalio.Pull.UP)
 
 # --- Torso bus (STEMMA QT): SCL=board.SCL, SDA=board.SDA ---
 
@@ -34,6 +48,37 @@ _pcf_last_raw = 0xFF          # last raw byte read (active-low typical, so idle 
 _pcf_stable = 0xFF            # debounced stable raw
 _pcf_same_count = 0           # how many consecutive identical reads
 PCF_DEBOUNCE_SAMPLES = 3      # change accepted after N same samples
+
+
+class MaskDebounce:
+    """
+    Edge-immediate debouncer with symmetric minimum-state hold time.
+
+    - Output changes immediately on an input edge.
+    - After each change, further changes are ignored for hold_ms.
+    """
+    def __init__(self, hold_ms=10, initial=False):
+        self.hold_ns = int(hold_ms * 1_000_000)
+        self.state = bool(initial)          # debounced output (True=pressed)
+        self._lock_until_ns = 0             # until this time, ignore further edges
+
+    def update(self, raw_pressed: bool, now_ns: int) -> bool:
+        # If we're in the mask window, ignore changes
+        if now_ns < self._lock_until_ns:
+            return self.state
+
+        # If input differs from output and we're not locked, accept immediately
+        if bool(raw_pressed) != self.state:
+            self.state = bool(raw_pressed)
+            self._lock_until_ns = now_ns + self.hold_ns
+
+        return self.state
+
+db_torso_l = MaskDebounce(hold_ms=10, initial=False)
+db_torso_r = MaskDebounce(hold_ms=10, initial=False)
+db_pedal   = MaskDebounce(hold_ms=10, initial=False)
+db_pedsense= MaskDebounce(hold_ms=10, initial=False)  # for status "connected"
+
 
 def pcf_init(i2c):
     """Put PCF8574 in 'input' mode by writing 1s to all pins."""
@@ -447,24 +492,26 @@ while True:
 
         reserved = b"\x00" * 6
 
-
-        # Read 8 handset buttons from PCF8574
-        pcf_raw = pcf_read_debounced(i2c_handset)
-
-        # Typical: pressed pulls low => invert so 1=pressed
-        pcf_pressed = (~pcf_raw) & 0xFF
-
-        # Map P0..P7 -> HID buttons bit0..bit7 (buttons 1..8)
-        # Map P0..P7 -> HID buttons bit0..bit7 (buttons 1..8)
-        buttons = (buttons & 0xFF00) | pcf_pressed
-
-
-
+        
         # 2) Compute scheduling for periodic IN report sends.
         now_ns = time.monotonic_ns()
 
         # Avoid division by zero (report_hz is clamped anyway).
         period_ns = int(1_000_000_000 // report_hz)
+
+        # raw reads: pull-up => pressed/connected is low (0)
+        raw_torso_l_pressed = (pin_torso_l.value == False)
+        raw_torso_r_pressed = (pin_torso_r.value == False)
+        raw_pedal_pressed   = (pin_pedal.value == False)
+        # pedal_sense: connected pulls low
+        raw_pedal_connected = (pin_pedal_sense.value == False)
+
+        torso_l_pressed = db_torso_l.update(raw_torso_l_pressed, now_ns)
+        torso_r_pressed = db_torso_r.update(raw_torso_r_pressed, now_ns)
+        pedal_pressed   = db_pedal.update(raw_pedal_pressed, now_ns)
+        pedal_connected = db_pedsense.update(raw_pedal_connected, now_ns)
+
+
 
         # 3) If it's time, build and send the next IN report.
         if now_ns >= next_tick_ns:
@@ -472,6 +519,39 @@ while True:
 
             # Sequence increments each report.
             seq = (seq + 1) & 0xFFFF
+
+            # ---- Build buttons_bits from scratch (deterministic) ----
+
+            # PCF buttons (P0..P7) => bits 0..7, pressed=1
+            pcf_raw = pcf_read_debounced(i2c_handset)
+            pcf_pressed = (~pcf_raw) & 0xFF
+
+            buttons_word = pcf_pressed  # bits0..7
+
+            # ---- Build buttons_bits (uint16) deterministically for THIS report ----
+
+            # PCF P0..P7 -> bits0..7 (pressed=1)
+            pcf_raw = pcf_read_debounced(i2c_handset)      # raw: 1=high, 0=low
+            pcf_pressed = (~pcf_raw) & 0xFF                # pressed pulls low
+
+            buttons_word = pcf_pressed                     # bits0..7
+
+            # torso L/R -> bits9..10
+            if torso_l_pressed:
+                buttons_word |= (1 << 9)
+            if torso_r_pressed:
+                buttons_word |= (1 << 10)
+
+            # pedal -> bit11
+            if pedal_pressed:
+                buttons_word |= (1 << 11)
+
+            # status bit4 = pedal_connected
+            if pedal_connected:
+                status_bits |= (1 << 4)
+            else:
+                status_bits &= ~(1 << 4)
+
 
 
             # Pack the report into the 32-byte buffer.
@@ -483,7 +563,7 @@ while True:
                 slider0, slider1,
                 load16,
                 roll16,
-                buttons,
+                buttons_word,
                 status_bits,
                 reserved
             )
@@ -494,6 +574,15 @@ while True:
 
         # 4) Low-rate heartbeat so you know code is alive + USB is connected.
         diag(f"alive t={time.monotonic():.1f} usb={supervisor.runtime.usb_connected}")
+        diag(
+            "GPIO raw: TL=%d TR=%d P=%d PS=%d | debounced: TL=%d TR=%d P=%d PS=%d" % (
+                int(pin_torso_l.value), int(pin_torso_r.value),
+                int(pin_pedal.value), int(pin_pedal_sense.value),
+                int(torso_l_pressed), int(torso_r_pressed),
+                int(pedal_pressed), int(pedal_connected),
+            ),
+        )
+
 
         # 5) Yield to USB stack / scheduler.
         time.sleep(0)
