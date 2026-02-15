@@ -16,9 +16,8 @@ import supervisor
 import board
 import digitalio
 import busio
+from cedargrove_nau7802 import NAU7802
 
-import digitalio
-import board
 
 pin_torso_l = digitalio.DigitalInOut(board.D10)
 pin_torso_l.switch_to_input(pull=digitalio.Pull.UP)
@@ -40,6 +39,52 @@ i2c_torso = busio.I2C(board.SCL, board.SDA)
 
 i2c_handset = busio.I2C(board.D25, board.D24)
 
+
+
+
+# --- NAU7802 load cell ADC (Torso bus) ---
+ADDR_NAU7802 = 0x2A
+
+# IMPORTANT:
+# - Use ONE init path only.
+# - Do NOT call nau.reset() after enable(True), it can shut analog power back off.
+# - CedarGrove driver expects 1-based channel numbers.
+nau = NAU7802(i2c_torso, address=ADDR_NAU7802, active_channels=2)  # ok even if we only use ch1
+
+nau_ok_runtime = False
+try:
+    # This is the key line that makes AV/E+ come up on the breakout.
+    nau_ok_runtime = bool(nau.enable(True))
+
+    # Use channel A only
+    nau.channel = 1
+
+    # Calibrate like the working example (no load on the cell)
+    nau.calibrate("INTERNAL")
+    nau.calibrate("OFFSET")
+
+except Exception as e:
+    print("NAU init failed:", repr(e))
+    nau_ok_runtime = False
+
+
+
+LOAD_SHIFT = 0   # 0 = show LSBs (most sensitive). Increase if it saturates (+/-32767).
+LOAD_ALPHA_SHIFT = 3  # IIR alpha = 1/(2^3)=1/8. Increase for smoother (e.g., 4 => 1/16)
+ADDR_NAU7802 = 0x2A
+REG_ADCO_B2 = 0x12  # MSB
+REG_ADCO_B1 = 0x13
+REG_ADCO_B0 = 0x14  # LSB
+
+
+
+
+# Filter state + output (HID field at offset 18)
+load16 = 0
+_load_filt = 0   # 32-bit accumulator (scaled)
+_load_filt_inited = False
+
+
 # --- PCF8574 on handset bus ---
 PCF_ADDR = 0x20
 
@@ -48,6 +93,7 @@ _pcf_last_raw = 0xFF          # last raw byte read (active-low typical, so idle 
 _pcf_stable = 0xFF            # debounced stable raw
 _pcf_same_count = 0           # how many consecutive identical reads
 PCF_DEBOUNCE_SAMPLES = 3      # change accepted after N same samples
+
 
 
 class MaskDebounce:
@@ -122,6 +168,66 @@ def pcf_read_debounced(i2c) -> int:
         _pcf_stable = _pcf_last_raw
 
     return _pcf_stable
+
+# --- NAU7802 raw conversion registers (24-bit result) ---
+# ADCO_B2..0: 0x12..0x14 (MSB..LSB)
+NAU_REG_ADCO_B2 = 0x12
+
+
+def _nau_read_raw24(i2c) -> int:
+    """
+    Read NAU7802 24-bit signed conversion result from ADCO_B2..B0 (0x12..0x14).
+    Returns a Python int in range [-2^23, 2^23-1].
+    """
+    buf = bytearray(3)
+
+    # Read 3 bytes starting at 0x12 (ADCO_B2)
+    while not i2c.try_lock():
+        pass
+    try:
+        i2c.writeto_then_readfrom(ADDR_NAU7802, bytes([REG_ADCO_B2]), buf)
+    finally:
+        i2c.unlock()
+
+    v = (buf[0] << 16) | (buf[1] << 8) | buf[2]
+
+    # sign extend 24-bit
+    if v & 0x800000:
+        v -= 0x1000000
+    return v
+
+
+def update_nau_load16():
+    global load16, _load_filt, _load_filt_inited, nau_ok_runtime
+
+    if not nau_ok_runtime:
+        return
+
+    # non-blocking: only update when a sample is ready
+    if not nau.available():
+        return
+
+    raw_i = _nau_read_raw24(i2c_torso)
+
+
+    # Light IIR in integer domain
+    if not _load_filt_inited:
+        _load_filt = raw_i
+        _load_filt_inited = True
+    else:
+        _load_filt = _load_filt + ((raw_i - _load_filt) >> LOAD_ALPHA_SHIFT)
+
+    # LSB-visible mapping: start with shift=0, raise if it saturates
+    v = int(_load_filt >> LOAD_SHIFT)
+    if v > 32767:
+        v = 32767
+    elif v < -32768:
+        v = -32768
+    load16 = v
+
+
+
+
 
 
 # -------- Expected I2C addresses (verified / from your scans + datasheets) --------
@@ -488,7 +594,7 @@ while True:
         update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0)
         status_bits = make_status_bits(running)
 
-        diag(f"flags lsm6={lsm6_ok} nau={nau_ok} bno={bno_ok} pcf={pcf_ok} status=0x{status_bits:04X}", period_s=1.0)
+        #diag(f"flags lsm6={lsm6_ok} nau={nau_ok} bno={bno_ok} pcf={pcf_ok} status=0x{status_bits:04X}", period_s=1.0)
 
         reserved = b"\x00" * 6
 
@@ -510,6 +616,10 @@ while True:
         torso_r_pressed = db_torso_r.update(raw_torso_r_pressed, now_ns)
         pedal_pressed   = db_pedal.update(raw_pedal_pressed, now_ns)
         pedal_connected = db_pedsense.update(raw_pedal_connected, now_ns)
+
+
+        update_nau_load16()
+
 
 
 
@@ -573,15 +683,12 @@ while True:
                 dev.send_report(in_buf)
 
         # 4) Low-rate heartbeat so you know code is alive + USB is connected.
-        diag(f"alive t={time.monotonic():.1f} usb={supervisor.runtime.usb_connected}")
-        diag(
-            "GPIO raw: TL=%d TR=%d P=%d PS=%d | debounced: TL=%d TR=%d P=%d PS=%d" % (
-                int(pin_torso_l.value), int(pin_torso_r.value),
-                int(pin_pedal.value), int(pin_pedal_sense.value),
-                int(torso_l_pressed), int(torso_r_pressed),
-                int(pedal_pressed), int(pedal_connected),
-            ),
-        )
+        #diag(f"alive t={time.monotonic():.1f} usb={supervisor.runtime.usb_connected}")
+
+        if (seq & 0x03FF) == 0:
+            print("NAU raw24:", _load_filt, " load16:", load16)
+
+
 
 
         # 5) Yield to USB stack / scheduler.
