@@ -6,6 +6,11 @@ File responsibilities
 - `init.py`: hardware/bus/device initialization helpers.
 - `readout.py`: sensor/button/status readout + debouncing + load filtering + presence flags.
 
+Dependencies (copy to CIRCUITPY `lib/`)
+- `cedargrove_nau7802.mpy`
+- `adafruit_bno08x/` (entire folder from CircuitPython bundle)
+- `adafruit_bus_device/` (required by BNO08x)
+
 HID test commands (`hidapitester.exe`)
 - OUT payload is 4 bytes `[cmd, sr_lo, sr_hi, flags]`; many tools prepend `0` as report-id/dummy.
 - Start 500 Hz (rate bytes little-endian: 500 = 0x01F4 -> 244,1):
@@ -20,6 +25,11 @@ HID test commands (`hidapitester.exe`)
   `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 -l 32 --open --read-input --timeout 2000`
 - Read continuous:
   `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 32 -t 2000 --quiet --read-input-forever 0`
+
+Quaternion stream behavior
+- HID report contains quaternion as `int16 x4` in order `(w, x, y, z)`.
+- Quaternion source is BNO085 fused rotation vector (gyro + accel + magnetometer path), configured at 250 Hz.
+- If HID sample rate is set above 250 Hz, firmware retransmits the last sampled quaternion until a new 250 Hz sample is available.
 
 Troubleshooting
 - No serial prints: confirm CDC enabled in `boot.py` and reopen Serial Monitor after reset.

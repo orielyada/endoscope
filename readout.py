@@ -42,6 +42,8 @@ _i2c_torso = None
 _i2c_handset = None
 _nau = None
 _nau_ok_runtime = False
+_bno = None
+_bno_ok_runtime = False
 
 _load16 = 0
 _load_filt = 0
@@ -52,6 +54,7 @@ _pcf_stable = 0xFF
 _pcf_same_count = 0
 
 _pcf_ok = False
+_pcf_io_ok = False
 _bno_ok = False
 _lsm6_ok = False
 _nau_ok = False
@@ -62,34 +65,117 @@ _db_torso_r = MaskDebounce(hold_ms=10, initial=False)
 _db_pedal = MaskDebounce(hold_ms=10, initial=False)
 _db_pedsense = MaskDebounce(hold_ms=10, initial=False)
 
+_BNO_MAX_HZ = 250
+_BNO_PERIOD_NS = int(1_000_000_000 // _BNO_MAX_HZ)
+_bno_last_sample_ns = 0
+# Identity quaternion mapped from [-1, 1] to int16 in w, x, y, z order.
+_quat_i16 = (32767, 0, 0, 0)
 
-def setup_readout(pins, i2c_torso, i2c_handset, nau, nau_ok_runtime):
+
+def _i2c_try_lock_with_timeout(i2c, timeout_s=0.05) -> bool:
+    """Attempt to lock I2C bus for up to timeout_s seconds."""
+    if i2c is None:
+        return False
+    t0 = time.monotonic()
+    while not i2c.try_lock():
+        if time.monotonic() - t0 > timeout_s:
+            return False
+    return True
+
+
+def setup_readout(pins, i2c_torso, i2c_handset, nau, nau_ok_runtime, bno=None, bno_ok_runtime=False):
     """Inject hardware handles/state so readout functions stay module-local."""
-    global _pins, _i2c_torso, _i2c_handset, _nau, _nau_ok_runtime
+    global _pins, _i2c_torso, _i2c_handset, _nau, _nau_ok_runtime, _bno, _bno_ok_runtime
     _pins = pins
     _i2c_torso = i2c_torso
     _i2c_handset = i2c_handset
     _nau = nau
     _nau_ok_runtime = bool(nau_ok_runtime)
+    _bno = bno
+    _bno_ok_runtime = bool(bno_ok_runtime)
+
+
+def _quat_f32_to_i16(v: float) -> int:
+    """Map quaternion float from [-1.0, 1.0] to int16 [-32768, 32767]."""
+    x = float(v)
+    if x < -1.0:
+        x = -1.0
+    elif x > 1.0:
+        x = 1.0
+    if x <= -1.0:
+        return -32768
+    if x >= 1.0:
+        return 32767
+    return int(round(x * 32767.0))
+
+
+def update_bno_quat_i16(now_ns: int) -> tuple[int, int, int, int]:
+    """
+    Return quaternion as int16 tuple (w, x, y, z).
+    Sampling is rate-limited to 250 Hz max; faster callers receive cached values.
+    """
+    global _quat_i16, _bno_last_sample_ns
+
+    if (now_ns - _bno_last_sample_ns) < _BNO_PERIOD_NS:
+        return _quat_i16
+    _bno_last_sample_ns = now_ns
+
+    if not _bno_ok_runtime or _bno is None:
+        return _quat_i16
+
+    try:
+        # Direct read like Adafruit's example - simple and straightforward
+        q = _bno.quaternion
+        
+        if not q or len(q) < 4:
+            return _quat_i16
+
+        # Adafruit BNO08X order is (x, y, z, w); HID stream uses (w, x, y, z).
+        qx_f, qy_f, qz_f, qw_f = q[0], q[1], q[2], q[3]
+        
+        _quat_i16 = (
+            _quat_f32_to_i16(qw_f),
+            _quat_f32_to_i16(qx_f),
+            _quat_f32_to_i16(qy_f),
+            _quat_f32_to_i16(qz_f),
+        )
+    except Exception:
+        # Keep last good quaternion on transient bus/sensor errors.
+        pass
+
+    return _quat_i16
+
+    return _quat_i16
 
 
 def pcf_init():
     """Set PCF8574 lines high so they behave as inputs (quasi-bidirectional)."""
-    while not _i2c_handset.try_lock():
-        pass
+    global _pcf_io_ok
+    if not _i2c_try_lock_with_timeout(_i2c_handset):
+        _pcf_io_ok = False
+        return
     try:
         _i2c_handset.writeto(PCF_ADDR, bytes([0xFF]))
+        _pcf_io_ok = True
+    except Exception:
+        _pcf_io_ok = False
     finally:
         _i2c_handset.unlock()
 
 
 def pcf_read_raw() -> int:
     """Read raw PCF8574 byte where 1=high and 0=low."""
+    global _pcf_io_ok
     buf = bytearray(1)
-    while not _i2c_handset.try_lock():
-        pass
+    if not _i2c_try_lock_with_timeout(_i2c_handset):
+        _pcf_io_ok = False
+        return _pcf_stable
     try:
         _i2c_handset.readfrom_into(PCF_ADDR, buf)
+        _pcf_io_ok = True
+    except Exception:
+        _pcf_io_ok = False
+        return _pcf_stable
     finally:
         _i2c_handset.unlock()
     return buf[0]
@@ -153,8 +239,8 @@ def _nau_read_raw24() -> int:
     """Read NAU7802 24-bit signed sample from ADCO registers."""
     buf = bytearray(3)
 
-    while not _i2c_torso.try_lock():
-        pass
+    if not _i2c_try_lock_with_timeout(_i2c_torso):
+        raise RuntimeError("NAU I2C lock timeout")
     try:
         _i2c_torso.writeto_then_readfrom(ADDR_NAU7802, bytes([REG_ADCO_B2]), buf)
     finally:
@@ -197,6 +283,8 @@ def update_nau_load16() -> int:
 
 def _scan_i2c_set(i2c, lock_timeout_s=0.05):
     """Scan one I2C bus and return addresses as a set."""
+    if i2c is None:
+        raise RuntimeError("I2C bus unavailable")
     t0 = time.monotonic()
     while not i2c.try_lock():
         if time.monotonic() - t0 > lock_timeout_s:
@@ -209,7 +297,7 @@ def _scan_i2c_set(i2c, lock_timeout_s=0.05):
 
 def update_i2c_presence(period_s=1.0):
     """Refresh presence flags with strict allow-list policy per bus."""
-    global _last_i2c_scan, _pcf_ok, _bno_ok, _lsm6_ok, _nau_ok
+    global _last_i2c_scan, _pcf_ok, _pcf_io_ok, _bno_ok, _lsm6_ok, _nau_ok
 
     now = time.monotonic()
     if now - _last_i2c_scan < period_s:
@@ -231,15 +319,21 @@ def update_i2c_presence(period_s=1.0):
         _nau_ok = False
         _lsm6_ok = False
 
-    try:
-        addrs_h = _scan_i2c_set(_i2c_handset)
-        # Any unexpected handset address fails handset OK flags for this cycle.
-        if addrs_h.issubset(ALLOWED_HANDSET):
-            _pcf_ok = (ADDR_PCF8574 in addrs_h)
-            _bno_ok = (ADDR_BNO085 in addrs_h)
-    except Exception:
-        _pcf_ok = False
-        _bno_ok = False
+    # Avoid bus scans on handset while BNO085 SH2 transport is active.
+    # Address scans can interfere with BNO packet framing on shared I2C.
+    if _bno_ok_runtime and _bno is not None:
+        _bno_ok = True
+        _pcf_ok = _pcf_io_ok
+    else:
+        try:
+            addrs_h = _scan_i2c_set(_i2c_handset)
+            # Any unexpected handset address fails handset OK flags for this cycle.
+            if addrs_h.issubset(ALLOWED_HANDSET):
+                _pcf_ok = (ADDR_PCF8574 in addrs_h)
+                _bno_ok = (ADDR_BNO085 in addrs_h)
+        except Exception:
+            _pcf_ok = False
+            _bno_ok = False
 
 
 def make_status_bits(running_flag: bool, pedal_connected: bool = False) -> int:

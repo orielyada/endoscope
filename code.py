@@ -14,7 +14,7 @@ import time
 import supervisor
 import usb_hid
 
-from init import find_vendor_hid_device, init_gpio_inputs, init_i2c_buses, init_nau7802
+from init import find_vendor_hid_device, init_bno085, init_gpio_inputs, init_i2c_buses, init_nau7802
 import readout
 
 
@@ -23,6 +23,7 @@ import readout
 # -----------------------------
 
 DIAG = True
+ENABLE_BNO085 = True
 _last_diag = 0.0
 
 
@@ -42,31 +43,49 @@ def diag(msg: str, period_s: float = 0.5) -> None:
 # Hardware init
 # -----------------------------
 
-pins = init_gpio_inputs()
-i2c_torso, i2c_handset = init_i2c_buses()
-nau, nau_ok_runtime = init_nau7802(i2c_torso)
+print("BOOT: code.py starting")
+try:
+    print("BOOT: init gpio")
+    pins = init_gpio_inputs()
+    print("BOOT: init i2c")
+    i2c_torso, i2c_handset = init_i2c_buses()
+    print("BOOT: init NAU7802")
+    nau, nau_ok_runtime = init_nau7802(i2c_torso)
+    if ENABLE_BNO085:
+        print("BOOT: init BNO085")
+        bno, bno_ok_runtime = init_bno085(i2c_handset, report_hz=250)
+        print("BOOT: init BNO085 done ok=", bno_ok_runtime)
+    else:
+        bno, bno_ok_runtime = None, False
+        print("BOOT: BNO085 disabled")
 
-# Match vendor HID endpoint created in boot.py.
-dev = find_vendor_hid_device(usb_hid, usage_page=0xFF00, usage=0x0001)
-if dev is None:
-    # Safe idle if USB config is not present.
+    # Match vendor HID endpoint created in boot.py.
+    dev = find_vendor_hid_device(usb_hid, usage_page=0xFF00, usage=0x0001)
+    if dev is None:
+        raise RuntimeError("Vendor HID endpoint not found")
+
+    readout.setup_readout(
+        pins=pins,
+        i2c_torso=i2c_torso,
+        i2c_handset=i2c_handset,
+        nau=nau,
+        nau_ok_runtime=nau_ok_runtime,
+        bno=bno,
+        bno_ok_runtime=bno_ok_runtime,
+    )
+    readout.pcf_init()
+    print("BOOT: readout setup done")
+except Exception as e:
+    print("BOOT EXC:", repr(e))
     while True:
         time.sleep(1)
-
-readout.setup_readout(
-    pins=pins,
-    i2c_torso=i2c_torso,
-    i2c_handset=i2c_handset,
-    nau=nau,
-    nau_ok_runtime=nau_ok_runtime,
-)
-readout.pcf_init()
 
 
 # -----------------------------
 # HID INPUT report definition
 # -----------------------------
 
+# Quaternion fields are int16 in (w, x, y, z) order.
 FMT_IN = "<HhhhhHHHHhhHH6s"
 in_buf = bytearray(32)
 # Contract requires reserved bytes to remain zero.
@@ -190,7 +209,9 @@ while True:
         if now_ns >= next_tick_ns:
             next_tick_ns = now_ns + period_ns
             seq = (seq + 1) & 0xFFFF
-
+            
+            qw, qx, qy, qz = readout.update_bno_quat_i16(now_ns)
+            
             buttons_word, pedal_connected = readout.sample_buttons(now_ns)
             status_bits = readout.make_status_bits(running, pedal_connected)
 
@@ -214,8 +235,9 @@ while True:
         # 5) Heartbeat + occasional load debug.
         diag(f"alive t={time.monotonic():.1f} usb={supervisor.runtime.usb_connected}")
 
-        #if (seq & 0x03FF) == 0:
-         #   print("NAU raw24:", readout.get_load_debug_raw(), " load16:", load16)
+        if (seq & 0x0F) == 0:
+            # Heartbeat only; no verbose quaternion debug printing
+            pass
 
         time.sleep(0)
 
