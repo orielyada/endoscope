@@ -69,7 +69,7 @@ except Exception as e:
 
 
 
-LOAD_SHIFT = 0   # 0 = show LSBs (most sensitive). Increase if it saturates (+/-32767).
+LOAD_SHIFT = 5   # 0 = show LSBs (most sensitive). Increase if it saturates (+/-32767).
 LOAD_ALPHA_SHIFT = 3  # IIR alpha = 1/(2^3)=1/8. Increase for smoother (e.g., 4 => 1/16)
 ADDR_NAU7802 = 0x2A
 REG_ADCO_B2 = 0x12  # MSB
@@ -168,6 +168,43 @@ def pcf_read_debounced(i2c) -> int:
         _pcf_stable = _pcf_last_raw
 
     return _pcf_stable
+
+
+def _read_local_inputs(now_ns: int):
+    """Return debounced states for torso buttons + pedal + pedal sense."""
+    raw_torso_l_pressed = (pin_torso_l.value is False)
+    raw_torso_r_pressed = (pin_torso_r.value is False)
+    raw_pedal_pressed = (pin_pedal.value is False)
+    raw_pedal_connected = (pin_pedal_sense.value is False)
+
+    torso_l_pressed = db_torso_l.update(raw_torso_l_pressed, now_ns)
+    torso_r_pressed = db_torso_r.update(raw_torso_r_pressed, now_ns)
+    pedal_pressed = db_pedal.update(raw_pedal_pressed, now_ns)
+    pedal_connected = db_pedsense.update(raw_pedal_connected, now_ns)
+
+    return torso_l_pressed, torso_r_pressed, pedal_pressed, pedal_connected
+
+
+def sample_buttons(now_ns: int) -> tuple[int, bool]:
+    """
+    Build the 16-bit buttons word and report pedal connectivity.
+    Returns (buttons_word, pedal_connected).
+    """
+    torso_l_pressed, torso_r_pressed, pedal_pressed, pedal_connected = _read_local_inputs(now_ns)
+
+    # PCF8574 lines map to bits0..7, pressed pulls low.
+    pcf_raw = pcf_read_debounced(i2c_handset)
+    pcf_pressed = (~pcf_raw) & 0xFF
+
+    buttons_word = pcf_pressed
+    if torso_l_pressed:
+        buttons_word |= (1 << 9)
+    if torso_r_pressed:
+        buttons_word |= (1 << 10)
+    if pedal_pressed:
+        buttons_word |= (1 << 11)
+
+    return buttons_word, pedal_connected
 
 # --- NAU7802 raw conversion registers (24-bit result) ---
 # ADCO_B2..0: 0x12..0x14 (MSB..LSB)
@@ -313,7 +350,7 @@ def update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0):
 
 
 
-def make_status_bits(running_flag: bool) -> int:
+def make_status_bits(running_flag: bool, pedal_connected: bool = False) -> int:
     status = 0
     status |= (1 << 0)  # ready
     status |= (1 << 1)  # init_ok
@@ -325,6 +362,9 @@ def make_status_bits(running_flag: bool) -> int:
     handset_connected = (pcf_ok or bno_ok)
     if handset_connected:
         status |= (1 << 3)
+
+    if pedal_connected:
+        status |= (1 << 4)
 
     # device OK bits
     if lsm6_ok: status |= (1 << 6)
@@ -416,6 +456,7 @@ FMT_IN = "<HhhhhHHHHhhHH6s"
 
 # Pre-allocated buffer to avoid heap churn at high rates.
 in_buf = bytearray(32)
+RESERVED_BYTES = b"\x00" * 6  # reserved payload must stay zeroed
 
 
 # -----------------------------
@@ -490,15 +531,6 @@ out3 = b"\x00\x00\x00"
 
 # Cache of last raw OUT report bytes to suppress duplicates.
 last_out = None
-
-
-def make_status(running_flag: bool) -> int:
-    """
-    Produce a simple status signature.
-    Useful to verify the device received START/STOP, even if you don't
-    change any other behavior yet.
-    """
-    return 0x5678 if running_flag else 0x1234
 
 
 def poll_out_and_apply() -> None:
@@ -592,36 +624,15 @@ while True:
         poll_out_and_apply()
 
         update_i2c_presence(i2c_torso, i2c_handset, period_s=1.0)
-        status_bits = make_status_bits(running)
+        update_nau_load16()
 
-        #diag(f"flags lsm6={lsm6_ok} nau={nau_ok} bno={bno_ok} pcf={pcf_ok} status=0x{status_bits:04X}", period_s=1.0)
+        #diag(f"flags lsm6={lsm6_ok} nau={nau_ok} bno={bno_ok} pcf={pcf_ok}", period_s=1.0)
 
-        reserved = b"\x00" * 6
-
-        
         # 2) Compute scheduling for periodic IN report sends.
         now_ns = time.monotonic_ns()
 
         # Avoid division by zero (report_hz is clamped anyway).
         period_ns = int(1_000_000_000 // report_hz)
-
-        # raw reads: pull-up => pressed/connected is low (0)
-        raw_torso_l_pressed = (pin_torso_l.value == False)
-        raw_torso_r_pressed = (pin_torso_r.value == False)
-        raw_pedal_pressed   = (pin_pedal.value == False)
-        # pedal_sense: connected pulls low
-        raw_pedal_connected = (pin_pedal_sense.value == False)
-
-        torso_l_pressed = db_torso_l.update(raw_torso_l_pressed, now_ns)
-        torso_r_pressed = db_torso_r.update(raw_torso_r_pressed, now_ns)
-        pedal_pressed   = db_pedal.update(raw_pedal_pressed, now_ns)
-        pedal_connected = db_pedsense.update(raw_pedal_connected, now_ns)
-
-
-        update_nau_load16()
-
-
-
 
         # 3) If it's time, build and send the next IN report.
         if now_ns >= next_tick_ns:
@@ -630,39 +641,8 @@ while True:
             # Sequence increments each report.
             seq = (seq + 1) & 0xFFFF
 
-            # ---- Build buttons_bits from scratch (deterministic) ----
-
-            # PCF buttons (P0..P7) => bits 0..7, pressed=1
-            pcf_raw = pcf_read_debounced(i2c_handset)
-            pcf_pressed = (~pcf_raw) & 0xFF
-
-            buttons_word = pcf_pressed  # bits0..7
-
-            # ---- Build buttons_bits (uint16) deterministically for THIS report ----
-
-            # PCF P0..P7 -> bits0..7 (pressed=1)
-            pcf_raw = pcf_read_debounced(i2c_handset)      # raw: 1=high, 0=low
-            pcf_pressed = (~pcf_raw) & 0xFF                # pressed pulls low
-
-            buttons_word = pcf_pressed                     # bits0..7
-
-            # torso L/R -> bits9..10
-            if torso_l_pressed:
-                buttons_word |= (1 << 9)
-            if torso_r_pressed:
-                buttons_word |= (1 << 10)
-
-            # pedal -> bit11
-            if pedal_pressed:
-                buttons_word |= (1 << 11)
-
-            # status bit4 = pedal_connected
-            if pedal_connected:
-                status_bits |= (1 << 4)
-            else:
-                status_bits &= ~(1 << 4)
-
-
+            buttons_word, pedal_connected = sample_buttons(now_ns)
+            status_bits = make_status_bits(running, pedal_connected)
 
             # Pack the report into the 32-byte buffer.
             struct.pack_into(
@@ -675,7 +655,7 @@ while True:
                 roll16,
                 buttons_word,
                 status_bits,
-                reserved
+                RESERVED_BYTES
             )
 
             # If running, send to host as HID INPUT report (32 bytes).
