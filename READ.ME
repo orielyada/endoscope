@@ -1,0 +1,27 @@
+Endoscope firmware quick notes
+
+File responsibilities
+- `boot.py`: USB identity + vendor HID descriptor (IN=32, OUT=3) and HID enable.
+- `code.py`: runtime orchestration (init calls, OUT command apply, main loop, HID packing/send).
+- `init.py`: hardware/bus/device initialization helpers.
+- `readout.py`: sensor/button/status readout + debouncing + load filtering + presence flags.
+
+HID test commands (`hidapitester.exe`)
+- Start 500 Hz (rate bytes little-endian: 500 = 0x01F4 -> 244,1):
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 4 --send-output 0,1,244,1`
+- Start 4 Hz (4 = 0x0004 -> 4,0):
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 4 --send-output 0,1,4,0`
+- Stop:
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 4 --send-output 0,2,0,0`
+- Read one report:
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 -l 32 --open --read-input --timeout 2000`
+- Read continuous:
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 32 -t 2000 --quiet --read-input-forever 0`
+
+Troubleshooting
+- No serial prints: confirm CDC enabled in `boot.py` and reopen Serial Monitor after reset.
+- No HID device: confirm usage page/usage in `boot.py` are `0xFF00/0x0001`.
+- START works but no stream: verify `running=True` print and then run `--read-input`.
+- STOP does not halt stream: check `if running: dev.send_report(in_buf)` in `code.py`.
+- Buttons not changing: verify PCF8574 present at `0x20` and pedal/torso wiring are active-low.
+- Load stuck at zero: verify NAU init prints and that `update_nau_load16()` is being called each loop.
