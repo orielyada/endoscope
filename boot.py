@@ -2,14 +2,19 @@ import usb_hid
 import usb_cdc
 import supervisor
 
+# Expose custom product/manufacturer strings for host-side identification.
 supervisor.set_usb_identification(
     manufacturer="OriElyada",
     product="Endoscope",
 )
 
-# Ensure CDC serial is enabled
+# Keep CDC console/data enabled for serial debug and control.
 usb_cdc.enable(console=True, data=True)
 
+# Vendor HID descriptor:
+# - Usage page 0xFF00 / usage 0x0001
+# - IN report 32 bytes
+# - OUT report 3 bytes
 REPORT_DESC = bytes((
     0x06, 0x00, 0xFF,
     0x09, 0x01,
@@ -30,6 +35,7 @@ REPORT_DESC = bytes((
     0xC0
 ))
 
+# Single vendor-specific HID interface (no keyboard/mouse/gamepad composite).
 endoscope_hid = usb_hid.Device(
     report_descriptor=REPORT_DESC,
     usage_page=0xFF00,
@@ -39,4 +45,5 @@ endoscope_hid = usb_hid.Device(
     out_report_lengths=(3,),
 )
 
+# Enable only this HID device at boot.
 usb_hid.enable((endoscope_hid,), boot_device=False)
