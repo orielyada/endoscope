@@ -79,6 +79,8 @@ RESERVED_BYTES = b"\x00" * 6
 
 CMD_START = 0x01
 CMD_STOP = 0x02
+# OUT payload (without optional host-side leading report-id/dummy byte):
+# [cmd, sr_lo, sr_hi, flags]
 
 
 def clamp_sr(hz: int) -> int:
@@ -128,18 +130,33 @@ def poll_out_and_apply() -> None:
 
     print("OUT rb=", list(rb))
 
-    # Support both styles:
-    # [0, cmd, rate, ...] from hidapitester and [cmd, rate, ...] raw payload.
-    if len(rb) >= 4 and rb[0] == 0:
+    # Support both styles while preserving the known leading dummy-byte quirk:
+    # [0, cmd, sr_lo, sr_hi, flags, ...] and [cmd, sr_lo, sr_hi, flags, ...].
+    # Keep fallbacks for older packet shapes.
+    if len(rb) >= 5 and rb[0] == 0:
         cmd = rb[1]
-        sr = rb[2]
+        sr = rb[2] | (rb[3] << 8)
+    elif len(rb) >= 4:
+        if rb[0] == 0:
+            cmd = rb[1]
+            sr = rb[2] | (rb[3] << 8)
+        else:
+            cmd = rb[0]
+            sr = rb[1] | (rb[2] << 8)
     elif len(rb) >= 3:
+        if rb[0] == 0:
+            cmd = rb[1]
+            sr = rb[2]
+        else:
+            cmd = rb[0]
+            sr = rb[1] | (rb[2] << 8)
+    elif len(rb) >= 2:
         cmd = rb[0]
         sr = rb[1]
     else:
         return
 
-    print("OUT raw:", rb, "cmd:", cmd, "sr8:", sr)
+    print("OUT raw:", rb, "cmd:", cmd, "sr16:", sr)
 
     if cmd == CMD_START:
         report_hz = clamp_sr(sr)
@@ -197,8 +214,8 @@ while True:
         # 5) Heartbeat + occasional load debug.
         diag(f"alive t={time.monotonic():.1f} usb={supervisor.runtime.usb_connected}")
 
-        if (seq & 0x03FF) == 0:
-            print("NAU raw24:", readout.get_load_debug_raw(), " load16:", load16)
+        #if (seq & 0x03FF) == 0:
+         #   print("NAU raw24:", readout.get_load_debug_raw(), " load16:", load16)
 
         time.sleep(0)
 

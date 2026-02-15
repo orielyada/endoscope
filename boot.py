@@ -14,7 +14,7 @@ usb_cdc.enable(console=True, data=True)
 # Vendor HID descriptor:
 # - Usage page 0xFF00 / usage 0x0001
 # - IN report 32 bytes
-# - OUT report 3 bytes
+# - OUT report 4 bytes: [cmd, sr_lo, sr_hi, flags]
 REPORT_DESC = bytes((
     0x06, 0x00, 0xFF,
     0x09, 0x01,
@@ -29,7 +29,7 @@ REPORT_DESC = bytes((
 
     0x09, 0x03,
     0x75, 0x08,
-    0x95, 0x03,
+    0x95, 0x04,
     0x91, 0x02,
 
     0xC0
@@ -42,7 +42,7 @@ endoscope_hid = usb_hid.Device(
     usage=0x0001,
     report_ids=(0,),
     in_report_lengths=(32,),
-    out_report_lengths=(3,),
+    out_report_lengths=(4,),
 )
 
 # Enable only this HID device at boot.

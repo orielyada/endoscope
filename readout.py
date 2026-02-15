@@ -9,9 +9,9 @@ ADDR_LSM6DSOX = 0x6A
 ADDR_PCF8574 = 0x20
 ADDR_BNO085 = 0x4A
 
-LOAD_SHIFT = 5
-LOAD_ALPHA_SHIFT = 3
-PCF_DEBOUNCE_SAMPLES = 3
+LOAD_SHIFT = 5              #>> 5 means downshift raw by 32 to fit int16 range with some headroom for overscale.
+LOAD_ALPHA_SHIFT = 0        #>> 0 means no IIR smoothing, just downshift raw to fit int16 range.
+PCF_DEBOUNCE_SAMPLES = 3    # Number of consecutive stable samples required to update debounced PCF state.
 
 ALLOWED_TORSO = {ADDR_NAU7802, ADDR_LSM6DSOX}
 ALLOWED_HANDSET = {ADDR_PCF8574, ADDR_BNO085}

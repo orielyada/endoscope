@@ -1,18 +1,21 @@
 Endoscope firmware quick notes
 
 File responsibilities
-- `boot.py`: USB identity + vendor HID descriptor (IN=32, OUT=3) and HID enable.
+- `boot.py`: USB identity + vendor HID descriptor (IN=32, OUT=4) and HID enable.
 - `code.py`: runtime orchestration (init calls, OUT command apply, main loop, HID packing/send).
 - `init.py`: hardware/bus/device initialization helpers.
 - `readout.py`: sensor/button/status readout + debouncing + load filtering + presence flags.
 
 HID test commands (`hidapitester.exe`)
+- OUT payload is 4 bytes `[cmd, sr_lo, sr_hi, flags]`; many tools prepend `0` as report-id/dummy.
 - Start 500 Hz (rate bytes little-endian: 500 = 0x01F4 -> 244,1):
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 4 --send-output 0,1,244,1`
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,1,244,1,0`
 - Start 4 Hz (4 = 0x0004 -> 4,0):
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 4 --send-output 0,1,4,0`
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,1,4,0,0`
+- Start 1000 Hz (1000 = 0x03E8 -> 232,3):
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,1,232,3,0`
 - Stop:
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 4 --send-output 0,2,0,0`
+  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,2,0,0,0`
 - Read one report:
   `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 -l 32 --open --read-input --timeout 2000`
 - Read continuous:
