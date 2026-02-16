@@ -71,6 +71,25 @@ _bno_last_sample_ns = 0
 # Identity quaternion mapped from [-1, 1] to int16 in w, x, y, z order.
 _quat_i16 = (32767, 0, 0, 0)
 
+# LSM6 fused roll state
+_lsm_roll_rad = 0.0
+_lsm_gyro_angle_rad = 0.0
+_lsm_last_sample_ns = 0
+_lsm_roll16 = 0
+_lsm6 = None
+_lsm6_ok_runtime = False
+
+# 1D Kalman filter state for X-Z angle (roll) fused with gyro Y-rate.
+_kf_angle = 0.0
+_kf_bias = 0.0
+_kf_P00 = 1.0
+_kf_P01 = 0.0
+_kf_P10 = 0.0
+_kf_P11 = 1.0
+_KF_Q_ANGLE = 0.02
+_KF_Q_BIAS = 0.002
+_KF_R_MEASURE = 0.08
+
 
 def _i2c_try_lock_with_timeout(i2c, timeout_s=0.05) -> bool:
     """Attempt to lock I2C bus for up to timeout_s seconds."""
@@ -83,9 +102,9 @@ def _i2c_try_lock_with_timeout(i2c, timeout_s=0.05) -> bool:
     return True
 
 
-def setup_readout(pins, i2c_torso, i2c_handset, nau, nau_ok_runtime, bno=None, bno_ok_runtime=False):
+def setup_readout(pins, i2c_torso, i2c_handset, nau, nau_ok_runtime, bno=None, bno_ok_runtime=False, lsm6=None, lsm6_ok_runtime=False):
     """Inject hardware handles/state so readout functions stay module-local."""
-    global _pins, _i2c_torso, _i2c_handset, _nau, _nau_ok_runtime, _bno, _bno_ok_runtime
+    global _pins, _i2c_torso, _i2c_handset, _nau, _nau_ok_runtime, _bno, _bno_ok_runtime, _lsm6, _lsm6_ok_runtime
     _pins = pins
     _i2c_torso = i2c_torso
     _i2c_handset = i2c_handset
@@ -93,6 +112,66 @@ def setup_readout(pins, i2c_torso, i2c_handset, nau, nau_ok_runtime, bno=None, b
     _nau_ok_runtime = bool(nau_ok_runtime)
     _bno = bno
     _bno_ok_runtime = bool(bno_ok_runtime)
+    _lsm6 = lsm6
+    _lsm6_ok_runtime = bool(lsm6_ok_runtime)
+
+    # LSM6 fused roll state
+    global _lsm_roll_rad, _lsm_gyro_angle_rad, _lsm_roll16, _lsm_last_sample_ns
+    global _kf_angle, _kf_bias, _kf_P00, _kf_P01, _kf_P10, _kf_P11
+    _lsm_roll_rad = 0.0
+    _lsm_gyro_angle_rad = 0.0
+    _lsm_roll16 = 0
+    _lsm_last_sample_ns = time.monotonic_ns()
+    _kf_angle = 0.0
+    _kf_bias = 0.0
+    _kf_P00 = 1.0
+    _kf_P01 = 0.0
+    _kf_P10 = 0.0
+    _kf_P11 = 1.0
+
+
+def _kalman_update_1d(angle_meas_rad: float, gyro_rate_rad_s: float, dt_s: float) -> float:
+    """1D Kalman update for angle+bias model."""
+    global _kf_angle, _kf_bias, _kf_P00, _kf_P01, _kf_P10, _kf_P11
+
+    # Predict
+    rate = gyro_rate_rad_s - _kf_bias
+    _kf_angle += dt_s * rate
+
+    _kf_P00 += dt_s * (dt_s * _kf_P11 - _kf_P01 - _kf_P10 + _KF_Q_ANGLE)
+    _kf_P01 -= dt_s * _kf_P11
+    _kf_P10 -= dt_s * _kf_P11
+    _kf_P11 += _KF_Q_BIAS * dt_s
+
+    # Update
+    innovation = angle_meas_rad - _kf_angle
+    S = _kf_P00 + _KF_R_MEASURE
+    if S <= 0.0:
+        return _kf_angle
+    K0 = _kf_P00 / S
+    K1 = _kf_P10 / S
+
+    _kf_angle += K0 * innovation
+    _kf_bias += K1 * innovation
+
+    P00 = _kf_P00
+    P01 = _kf_P01
+    _kf_P00 -= K0 * P00
+    _kf_P01 -= K0 * P01
+    _kf_P10 -= K1 * P00
+    _kf_P11 -= K1 * P01
+
+    return _kf_angle
+
+
+def _wrap_pi(a: float) -> float:
+    """Wrap radians to [-pi, pi]."""
+    import math
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
 
 
 def _quat_f32_to_i16(v: float) -> int:
@@ -142,8 +221,6 @@ def update_bno_quat_i16(now_ns: int) -> tuple[int, int, int, int]:
     except Exception:
         # Keep last good quaternion on transient bus/sensor errors.
         pass
-
-    return _quat_i16
 
     return _quat_i16
 
@@ -279,6 +356,59 @@ def update_nau_load16() -> int:
         v = -32768
     _load16 = v
     return _load16
+
+
+def update_lsm_roll16(now_ns: int) -> int:
+    """Fuse LSM6 accel X/Z and gyro Y to produce signed int16 roll.
+
+    Zero corresponds to X+ pointing down (aligned with gravity). Returns
+    degrees*10 as signed int16 mapped to range +/-1800 (0.1 deg resolution).
+    """
+    global _lsm_roll_rad, _lsm_gyro_angle_rad, _lsm_roll16, _lsm_last_sample_ns, _lsm6, _lsm6_ok_runtime, _kf_angle
+
+    if not _lsm6_ok_runtime or _lsm6 is None:
+        return _lsm_roll16
+
+    if _lsm_last_sample_ns == 0:
+        dt = 0.004
+    else:
+        dt = (now_ns - _lsm_last_sample_ns) / 1_000_000_000
+    if dt < 1e-6:
+        dt = 1e-6
+    elif dt > 0.05:
+        dt = 0.05
+    _lsm_last_sample_ns = now_ns
+
+    try:
+        ax, ay, az = _lsm6.acceleration  # m/s^2
+        gx, gy, gz = _lsm6.gyro          # rad/s on Adafruit LSM6 drivers
+    except Exception:
+        return _lsm_roll16
+
+    # Board mounting convention: invert Y gyro to match X-Z accel angle direction.
+    gy = -gy
+
+    # X-Z tilt angle: 0 when +X points down and Z ~= 0.
+    import math
+    accel_angle = math.atan2(az, -ax)
+
+    if _lsm_roll16 == 0 and abs(_kf_angle) < 1e-6:
+        # Initialize filter to measured angle to avoid startup transient.
+        _kf_angle = accel_angle
+
+    # Gyro Y is the rotation rate orthogonal to X-Z tilt plane.
+    _lsm_gyro_angle_rad = _wrap_pi(_lsm_gyro_angle_rad + (gy * dt))
+    fused_angle = _kalman_update_1d(accel_angle, gy, dt)
+    _lsm_roll_rad = fused_angle
+
+    roll_deg10 = int(round((fused_angle * 180.0 / 3.14159265) * 10.0))
+    if roll_deg10 > 1800:
+        roll_deg10 = 1800
+    elif roll_deg10 < -1800:
+        roll_deg10 = -1800
+    _lsm_roll16 = roll_deg10
+
+    return _lsm_roll16
 
 
 def _scan_i2c_set(i2c, lock_timeout_s=0.05):

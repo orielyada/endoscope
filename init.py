@@ -140,6 +140,25 @@ def init_nau7802(i2c_torso):
     return nau, nau_ok_runtime
 
 
+def init_lsm6(i2c_torso):
+    """Initialize LSM6DSOX and return (device, runtime_ok_flag)."""
+    if i2c_torso is None:
+        print("LSM6 init skipped: torso I2C unavailable")
+        return None, False
+    try:
+        from adafruit_lsm6ds.lsm6dsox import LSM6DSOX
+    except Exception as e:
+        print("LSM6 lib missing:", repr(e))
+        return None, False
+
+    try:
+        lsm = LSM6DSOX(i2c_torso)
+        return lsm, True
+    except Exception as e:
+        print("LSM6 init failed:", repr(e))
+        return None, False
+
+
 def init_bno085(i2c_handset, report_hz=250):
     """Initialize BNO085 rotation-vector output and return (device, runtime_ok_flag)."""
     if i2c_handset is None:

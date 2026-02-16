@@ -14,7 +14,7 @@ import time
 import supervisor
 import usb_hid
 
-from init import find_vendor_hid_device, init_bno085, init_gpio_inputs, init_i2c_buses, init_nau7802
+from init import find_vendor_hid_device, init_bno085, init_gpio_inputs, init_i2c_buses, init_nau7802, init_lsm6
 import readout
 
 
@@ -51,6 +51,8 @@ try:
     i2c_torso, i2c_handset = init_i2c_buses()
     print("BOOT: init NAU7802")
     nau, nau_ok_runtime = init_nau7802(i2c_torso)
+    print("BOOT: init LSM6DSOX")
+    lsm6, lsm6_ok_runtime = init_lsm6(i2c_torso)
     if ENABLE_BNO085:
         print("BOOT: init BNO085")
         bno, bno_ok_runtime = init_bno085(i2c_handset, report_hz=250)
@@ -72,6 +74,8 @@ try:
         nau_ok_runtime=nau_ok_runtime,
         bno=bno,
         bno_ok_runtime=bno_ok_runtime,
+        lsm6=lsm6,
+        lsm6_ok_runtime=lsm6_ok_runtime,
     )
     readout.pcf_init()
     print("BOOT: readout setup done")
@@ -204,14 +208,16 @@ while True:
 
         # 3) Stream scheduler based on current rate.
         now_ns = time.monotonic_ns()
+        # Keep fusion running at loop speed; HID rate only controls transmit cadence.
+        roll16 = readout.update_lsm_roll16(now_ns)
         period_ns = int(1_000_000_000 // report_hz)
 
         if now_ns >= next_tick_ns:
             next_tick_ns = now_ns + period_ns
             seq = (seq + 1) & 0xFFFF
-            
+
             qw, qx, qy, qz = readout.update_bno_quat_i16(now_ns)
-            
+
             buttons_word, pedal_connected = readout.sample_buttons(now_ns)
             status_bits = readout.make_status_bits(running, pedal_connected)
 
