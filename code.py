@@ -14,7 +14,7 @@ import time
 import supervisor
 import usb_hid
 
-from init import find_vendor_hid_device, init_bno085, init_gpio_inputs, init_i2c_buses, init_nau7802, init_lsm6
+from init import find_vendor_hid_device, init_adcs, init_bno085, init_gpio_inputs, init_i2c_buses, init_nau7802, init_lsm6
 import readout
 
 
@@ -47,6 +47,8 @@ print("BOOT: code.py starting")
 try:
     print("BOOT: init gpio")
     pins = init_gpio_inputs()
+    print("BOOT: init ADCs")
+    adcs = init_adcs()
     print("BOOT: init i2c")
     i2c_torso, i2c_handset = init_i2c_buses()
     print("BOOT: init NAU7802")
@@ -92,8 +94,8 @@ except Exception as e:
 # Quaternion fields are int16 in (w, x, y, z) order.
 FMT_IN = "<HhhhhHHHHhhHH6s"
 in_buf = bytearray(32)
-# Contract requires reserved bytes to remain zero.
-RESERVED_BYTES = b"\x00" * 6
+# Tail bytes are reserved except [1:0] which carry current report_hz (uint16 LE).
+RESERVED_BYTES = bytearray(6)
 
 
 # -----------------------------
@@ -104,6 +106,7 @@ CMD_START = 0x01
 CMD_STOP = 0x02
 # OUT payload (without optional host-side leading report-id/dummy byte):
 # [cmd, sr_lo, sr_hi, flags]
+ADC_FULL_SCALE = 65535
 
 
 def clamp_sr(hz: int) -> int:
@@ -115,6 +118,29 @@ def clamp_sr(hz: int) -> int:
     if hz > 1000:
         return 1000
     return int(hz)
+
+
+def slider2_transform(raw: int, full_scale: int = ADC_FULL_SCALE) -> int:
+    """
+    Linearize rheostat-to-GND with 10k pullup:
+      y = Vout/Vcc = R/(R+10k)
+      x = R/10k = y/(1-y)
+    Return x mapped to uint16 [0..65535].
+    """
+    fs = int(full_scale)
+    r = int(raw)
+    if r <= 0:
+        return 0
+    den = int(full_scale) - int(raw)
+    if den <= 0:
+        return 65535
+    # x in [0..1] over ideal usable range (raw up to fs/2), scaled to uint16.
+    v = (float(r) / float(den)) * float(fs)
+    if v >= float(fs):
+        return 65535
+    if v <= 0.0:
+        return 0
+    return int(v)
 
 
 # -----------------------------
@@ -217,9 +243,16 @@ while True:
             seq = (seq + 1) & 0xFFFF
 
             qw, qx, qy, qz = readout.update_bno_quat_i16(now_ns)
+            knob0 = adcs[0].value if adcs[0] is not None else 0
+            knob1 = adcs[1].value if adcs[1] is not None else 0
+            slider0 = adcs[2].value if adcs[2] is not None else 0
+            slider1_raw = adcs[3].value if adcs[3] is not None else 0
+            slider1 = slider2_transform(slider1_raw)
 
             buttons_word, pedal_connected = readout.sample_buttons(now_ns)
             status_bits = readout.make_status_bits(running, pedal_connected)
+            RESERVED_BYTES[0] = report_hz & 0xFF
+            RESERVED_BYTES[1] = (report_hz >> 8) & 0xFF
 
             # 4) Pack one 32-byte report exactly per locked HID layout.
             struct.pack_into(

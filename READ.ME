@@ -31,6 +31,15 @@ Quaternion stream behavior
 - Quaternion source is BNO085 fused rotation vector (gyro + accel + magnetometer path), configured at 250 Hz.
 - If HID sample rate is set above 250 Hz, firmware retransmits the last sampled quaternion until a new 250 Hz sample is available.
 
+ADC stream behavior
+- Four onboard ADC channels are enabled at max native resolution via CircuitPython `analogio.AnalogIn`.
+- Mapping into HID fields:
+  - `knob0` <- `A0`
+  - `knob1` <- `A1`
+  - `slider0` <- `A2`
+  - `slider1` <- `A3`
+- ADC values are sampled on each HID report tick, so effective ADC sample rate equals current output SR.
+
 Troubleshooting
 - No serial prints: confirm CDC enabled in `boot.py` and reopen Serial Monitor after reset.
 - No HID device: confirm usage page/usage in `boot.py` are `0xFF00/0x0001`.

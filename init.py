@@ -1,6 +1,7 @@
 import board
 import busio
 import digitalio
+import analogio
 import time
 from cedargrove_nau7802 import NAU7802
 
@@ -25,6 +26,25 @@ def init_gpio_inputs():
         "pedal": pin_pedal,
         "pedal_sense": pin_pedal_sense,
     }
+
+
+def init_adcs():
+    """Initialize four ADC channels mapped to A0..A3 and return list of AnalogIn/None."""
+    channels = []
+    for idx, pin_name in enumerate(("A0", "A1", "A2", "A3")):
+        pin = getattr(board, pin_name, None)
+        if pin is None:
+            print(f"ADC{idx} init skipped: {pin_name} not present")
+            channels.append(None)
+            continue
+        try:
+            adc = analogio.AnalogIn(pin)
+            channels.append(adc)
+            print(f"ADC{idx} init ok on {pin_name}")
+        except Exception as e:
+            print(f"ADC{idx} init failed on {pin_name}:", repr(e))
+            channels.append(None)
+    return channels
 
 
 def init_i2c_buses():
