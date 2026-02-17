@@ -467,9 +467,23 @@ def update_i2c_presence(period_s=1.0):
 
 
 def make_status_bits(running_flag: bool, pedal_connected: bool = False) -> int:
-    """Compose 16-bit status word matching the locked HID contract."""
+    """
+    Compose 16-bit status word matching the locked HID contract.
+
+    Bit definitions:
+    - bit0: fully_ready (set only when boot_ok and bits3..9 are all high)
+    - bit1: boot_ok (set after firmware init)
+    - bit2: running
+    - bit3: handset_connected (pcf_ok or bno_ok)
+    - bit4: pedal_connected
+    - bit5: peripherals_all_ok (lsm6_ok and nau_ok and bno_ok and pcf_ok)
+    - bit6: lsm6_ok
+    - bit7: nau_ok
+    - bit8: bno_ok
+    - bit9: pcf_ok
+    """
     status = 0
-    status |= (1 << 0)
+    # boot_ok
     status |= (1 << 1)
 
     if running_flag:
@@ -490,9 +504,14 @@ def make_status_bits(running_flag: bool, pedal_connected: bool = False) -> int:
     if _pcf_ok:
         status |= (1 << 9)
 
-    bit_passed = supervisor.runtime.usb_connected and _lsm6_ok and _nau_ok and _bno_ok and _pcf_ok
-    if bit_passed:
+    all_peripherals_ok = _lsm6_ok and _nau_ok and _bno_ok and _pcf_ok
+    if all_peripherals_ok:
         status |= (1 << 5)
+
+    # fully_ready only when boot_ok and bits3..9 are all high.
+    required_mask = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9)
+    if (status & required_mask) == required_mask:
+        status |= (1 << 0)
 
     return status
 

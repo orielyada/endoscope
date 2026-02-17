@@ -26,6 +26,50 @@ HID test commands (`hidapitester.exe`)
 - Read continuous:
   `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 32 -t 2000 --quiet --read-input-forever 0`
 
+HID protocol
+- Device: vendor HID, usage page `0xFF00`, usage `0x0001`
+- Report lengths: `IN=32` bytes, `OUT=4` bytes
+
+HID IN report (`32` bytes, little-endian)
+- `0..1`   `uint16`  `seq`
+- `2..3`   `int16`   `qw`
+- `4..5`   `int16`   `qx`
+- `6..7`   `int16`   `qy`
+- `8..9`   `int16`   `qz`
+- `10..11` `uint16`  `knob0`   (`A0`)
+- `12..13` `uint16`  `knob1`   (`A1`)
+- `14..15` `uint16`  `slider0` (`A2`)
+- `16..17` `uint16`  `slider1` (`A3`, rheostat-linearized)
+- `18..19` `int16`   `load16` (NAU7802)
+- `20..21` `int16`   `roll16` (LSM fused X-Z angle, deg*10)
+- `22..23` `uint16`  `buttons` bitfield
+- `24..25` `uint16`  `status` bitfield
+- `26..31` reserved tail:
+  - `26..27` current output sample rate Hz (`uint16`, little-endian)
+  - `28..31` reserved (`0`)
+
+HID OUT report (`4` bytes payload)
+- Payload bytes: `[cmd, sr_lo, sr_hi, flags]`
+- `cmd`:
+  - `0x01` START (sets `running=True` and applies sample rate)
+  - `0x02` STOP  (sets `running=False`)
+- `sr_lo/sr_hi`: sample rate in Hz, `uint16` little-endian, clamped to `1..1000` (`0` maps to `500`)
+- `flags`: currently ignored by firmware
+- Host quirk: some tools prepend leading `0` report-id/dummy byte; firmware accepts both forms.
+
+Status bit logic (`uint16` at bytes `24..25`)
+- `bit0` `fully_ready`: `1` only when `boot_ok` and bits `3..9` are all `1`
+- `bit1` `boot_ok`: `1` after firmware init (set by device)
+- `bit2` `running`: `1` while streaming is running
+- `bit3` `handset_connected`: `1` when `pcf_ok or bno_ok`
+- `bit4` `pedal_connected`: `1` when pedal sense indicates connected
+- `bit5` `peripherals_all_ok`: `1` when `lsm6_ok and nau_ok and bno_ok and pcf_ok`
+- `bit6` `lsm6_ok`: `1` when LSM6DSOX present/healthy
+- `bit7` `nau_ok`: `1` when NAU7802 present/healthy
+- `bit8` `bno_ok`: `1` when BNO085 present/healthy
+- `bit9` `pcf_ok`: `1` when PCF8574 present/healthy
+- `bits10..15`: currently unused (`0`)
+
 Quaternion stream behavior
 - HID report contains quaternion as `int16 x4` in order `(w, x, y, z)`.
 - Quaternion source is BNO085 fused rotation vector (gyro + accel + magnetometer path), configured at 250 Hz.
