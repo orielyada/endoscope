@@ -212,9 +212,14 @@ def init_bno085(i2c_handset, report_hz=250):
     return bno, bno_ok_runtime
 
 
-def find_vendor_hid_device(usb_hid, usage_page=0xFF00, usage=0x0001):
-    """Return matching vendor HID device or None if not present."""
+def find_hid_device(usb_hid, usage_page, usage):
+    """Return matching HID device or None if not present."""
     for dev in usb_hid.devices:
         if dev.usage_page == usage_page and dev.usage == usage:
             return dev
     return None
+
+
+def find_vendor_hid_device(usb_hid, usage_page=0xFF00, usage=0x0001):
+    """Backward-compatible alias for older callers."""
+    return find_hid_device(usb_hid, usage_page=usage_page, usage=usage)

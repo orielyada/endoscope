@@ -68,8 +68,10 @@ _db_pedsense = MaskDebounce(hold_ms=10, initial=False)
 _BNO_MAX_HZ = 250
 _BNO_PERIOD_NS = int(1_000_000_000 // _BNO_MAX_HZ)
 _bno_last_sample_ns = 0
-# Identity quaternion mapped from [-1, 1] to int16 in w, x, y, z order.
-_quat_i16 = (32767, 0, 0, 0)
+# Identity quaternion in Q1.14 mapped to (x, y, z, w).
+_quat_q14 = (0, 0, 0, 16384)
+_quat_stat = 0
+_quat_acc_attr_missing_warned = False
 
 # LSM6 fused roll state
 _lsm_roll_rad = 0.0
@@ -174,55 +176,85 @@ def _wrap_pi(a: float) -> float:
     return a
 
 
-def _quat_f32_to_i16(v: float) -> int:
-    """Map quaternion float from [-1.0, 1.0] to int16 [-32768, 32767]."""
+def _quat_f32_to_q14(v: float) -> int:
+    """Map quaternion float from [-1.0, 1.0] to Q1.14 int16 with scale 16384."""
     x = float(v)
     if x < -1.0:
         x = -1.0
     elif x > 1.0:
         x = 1.0
-    if x <= -1.0:
+    q = int(round(x * 16384.0))
+    if q < -32768:
         return -32768
-    if x >= 1.0:
+    if q > 32767:
         return 32767
-    return int(round(x * 32767.0))
+    return q
 
 
-def update_bno_quat_i16(now_ns: int) -> tuple[int, int, int, int]:
+def _read_quat_accuracy() -> int:
+    """Best-effort read of BNO quaternion accuracy with fallback to -1."""
+    global _quat_acc_attr_missing_warned
+    if _bno is None:
+        return -1
+
+    for attr_name in ("quaternion_accuracy", "accuracy", "rotation_vector_accuracy"):
+        try:
+            acc = getattr(_bno, attr_name)
+            if callable(acc):
+                acc = acc()
+            return int(acc)
+        except Exception:
+            continue
+
+    if not _quat_acc_attr_missing_warned:
+        print("BNO accuracy attr not found; using runtime connectivity fallback for quatStat.")
+        _quat_acc_attr_missing_warned = True
+    return -1
+
+
+def update_bno_quat_q14(now_ns: int) -> tuple[int, int, int, int, int]:
     """
-    Return quaternion as int16 tuple (w, x, y, z).
+    Return quaternion tuple (qx, qy, qz, qw, quat_stat) in Q1.14.
     Sampling is rate-limited to 250 Hz max; faster callers receive cached values.
     """
-    global _quat_i16, _bno_last_sample_ns
+    global _quat_q14, _quat_stat, _bno_last_sample_ns
 
     if (now_ns - _bno_last_sample_ns) < _BNO_PERIOD_NS:
-        return _quat_i16
+        return _quat_q14[0], _quat_q14[1], _quat_q14[2], _quat_q14[3], _quat_stat
     _bno_last_sample_ns = now_ns
 
     if not _bno_ok_runtime or _bno is None:
-        return _quat_i16
+        _quat_stat = (1 if _bno_ok else 0)
+        return _quat_q14[0], _quat_q14[1], _quat_q14[2], _quat_q14[3], _quat_stat
 
     try:
-        # Direct read like Adafruit's example - simple and straightforward
         q = _bno.quaternion
-        
         if not q or len(q) < 4:
-            return _quat_i16
+            return _quat_q14[0], _quat_q14[1], _quat_q14[2], _quat_q14[3], _quat_stat
 
-        # Adafruit BNO08X order is (x, y, z, w); HID stream uses (w, x, y, z).
         qx_f, qy_f, qz_f, qw_f = q[0], q[1], q[2], q[3]
-        
-        _quat_i16 = (
-            _quat_f32_to_i16(qw_f),
-            _quat_f32_to_i16(qx_f),
-            _quat_f32_to_i16(qy_f),
-            _quat_f32_to_i16(qz_f),
+
+        _quat_q14 = (
+            _quat_f32_to_q14(qx_f),
+            _quat_f32_to_q14(qy_f),
+            _quat_f32_to_q14(qz_f),
+            _quat_f32_to_q14(qw_f),
         )
+
+        acc = _read_quat_accuracy()
+        if acc >= 0:
+            quat_valid = 1 if acc >= 2 else 0
+            quat_good = 1 if acc == 3 else 0
+            mag_suspect = 1 if acc <= 1 else 0
+        else:
+            quat_valid = 1 if _bno_ok else 0
+            quat_good = quat_valid
+            mag_suspect = 0 if quat_valid else 1
+        _quat_stat = quat_valid | (quat_good << 1) | (mag_suspect << 2)
     except Exception:
-        # Keep last good quaternion on transient bus/sensor errors.
         pass
 
-    return _quat_i16
+    return _quat_q14[0], _quat_q14[1], _quat_q14[2], _quat_q14[3], _quat_stat
 
 
 def pcf_init():

@@ -1,8 +1,8 @@
 Endoscope firmware quick notes
 
 File responsibilities
-- `boot.py`: USB identity + vendor HID descriptor (IN=32, OUT=4) and HID enable.
-- `code.py`: runtime orchestration (init calls, OUT command apply, main loop, HID packing/send).
+- `boot.py`: USB identity + joystick HID descriptor and HID enable.
+- `code.py`: runtime orchestration (init calls, OUT command apply, scheduling, HID packing/send).
 - `init.py`: hardware/bus/device initialization helpers.
 - `readout.py`: sensor/button/status readout + debouncing + load filtering + presence flags.
 
@@ -11,83 +11,148 @@ Dependencies (copy to CIRCUITPY `lib/`)
 - `adafruit_bno08x/` (entire folder from CircuitPython bundle)
 - `adafruit_bus_device/` (required by BNO08x)
 
-HID test commands (`hidapitester.exe`)
-- OUT payload is 4 bytes `[cmd, sr_lo, sr_hi, flags]`; many tools prepend `0` as report-id/dummy.
-- Start 500 Hz (rate bytes little-endian: 500 = 0x01F4 -> 244,1):
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,1,244,1,0`
-- Start 4 Hz (4 = 0x0004 -> 4,0):
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,1,4,0,0`
-- Start 1000 Hz (1000 = 0x03E8 -> 232,3):
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,1,232,3,0`
-- Stop:
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 5 --send-output 0,2,0,0,0`
-- Read one report:
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 -l 32 --open --read-input --timeout 2000`
-- Read continuous:
-  `hidapitester.exe --vidpid 239A:80F2 --usagePage FF00 --usage 1 --open -l 32 -t 2000 --quiet --read-input-forever 0`
+USB composition
+- CDC serial: enabled
+- MSC (CIRCUITPY drive): enabled
+- HID: one custom HID interface with two joystick application collections
 
-HID protocol
-- Device: vendor HID, usage page `0xFF00`, usage `0x0001`
-- Report lengths: `IN=32` bytes, `OUT=4` bytes
+HID device identity
+- Top-level Usage Page: Generic Desktop (`0x01`)
+- Top-level Usage: Joystick (`0x04`)
+- Two top-level application collections (both joystick)
+- Report IDs:
+  - `1`: INPUT, payload length `16` bytes
+  - `2`: INPUT, payload length `10` bytes
+  - `3`: OUTPUT, payload length `4` bytes
+- Collection mapping:
+  - Joystick #1: report `1` (input) and report `3` (output control)
+  - Joystick #2: report `2` (input, quaternion axes)
 
-HID IN report (`32` bytes, little-endian)
-- `0..1`   `uint16`  `seq`
-- `2..3`   `int16`   `qw`
-- `4..5`   `int16`   `qx`
-- `6..7`   `int16`   `qy`
-- `8..9`   `int16`   `qz`
-- `10..11` `uint16`  `knob0`   (`A0`)
-- `12..13` `uint16`  `knob1`   (`A1`)
-- `14..15` `uint16`  `slider0` (`A2`)
-- `16..17` `uint16`  `slider1` (`A3`, rheostat-linearized)
-- `18..19` `int16`   `load16` (NAU7802)
-- `20..21` `int16`   `roll16` (LSM fused X-Z angle, deg*10)
-- `22..23` `uint16`  `buttons` bitfield
-- `24..25` `uint16`  `status` bitfield
-- `26..31` reserved tail:
-  - `26..27` current output sample rate Hz (`uint16`, little-endian)
-  - `28..31` reserved (`0`)
+Notes on lengths
+- Payload lengths above EXCLUDE the leading Report ID byte on the wire.
+- Many host tools include Report ID as byte 0 in send/read buffers. This firmware tolerates both common OUT packet shapes.
 
-HID OUT report (`4` bytes payload)
+Report ID 1 (INPUT, 16-byte payload)
+- Byte layout (little-endian where applicable):
+  - `0`: `counter` (`uint8`, wraps at 255)
+  - `1..3`: `buttons24` (`uint24`, little-endian)
+  - `4..5`: axis0 `knob1` -> Usage `X (0x30)` (`int16`)
+  - `6..7`: axis1 `knob2` -> Usage `Y (0x31)` (`int16`)
+  - `8..9`: axis2 `force` -> Usage `Z (0x32)` (`int16`)
+  - `10..11`: axis3 `angle` -> Usage `Rz (0x35)` (`int16`)
+  - `12..13`: axis4 `slider1` -> Usage `Slider (0x36)` (`int16`)
+  - `14..15`: axis5 `slider2` -> Usage `Wheel (0x38)` (`int16`)
+
+Buttons mapping (`buttons24`, LSB-first)
+- `<7:0>`: status bits (`status[7:0]`)
+- `<15:8>`: PCF buttons `P0..P7`
+- `16`: `torso_R`
+- `17`: `torso_L`
+- `18`: `pedal`
+- `<23:19>`: reserved (`0`)
+
+Axis source mapping (runtime)
+- `knob1`: ADC `A0`, converted `uint16 -> int16` by subtracting 32768
+- `knob2`: ADC `A1`, converted `uint16 -> int16`
+- `force`: `load16` from NAU7802 (`int16`)
+- `angle`: `roll16` fused from LSM6 (`int16`, deg*10 range-limited in readout)
+- `slider1`: ADC `A2`, converted `uint16 -> int16`
+- `slider2`: ADC `A3` after rheostat linearization, then `uint16 -> int16`
+
+Axis logical range in descriptor
+- All six axes: logical min `-32768`, max `32767`
+
+Report ID 2 (INPUT, 10-byte payload, joystick #2)
+- Byte layout (little-endian):
+  - `0`: `counterQ` (`uint8`, wraps at 255)
+  - `1`: `quatStat` (`uint8`, exposed as 8 buttons on joystick #2)
+  - `2..3`: `qx` (`int16`, Generic Desktop `X (0x30)`)
+  - `4..5`: `qy` (`int16`, Generic Desktop `Y (0x31)`)
+  - `6..7`: `qz` (`int16`, Generic Desktop `Z (0x32)`)
+  - `8..9`: `qw` (`int16`, Generic Desktop `Rz (0x35)`)
+- `counterQ` remains a vendor-defined byte field before the button/axis data.
+
+Quaternion scaling
+- Format: signed Q1.14 fixed-point
+- Scale factor: `16384`
+- Conversion: `q_fixed = round(q_float * 16384)`
+- Descriptor logical range for quaternion axes (`X/Y/Z/Rz`): `-16384..16384`
+
+`quatStat` bits
+- `bit0`: `quat_valid` (derived: accuracy >= 2)
+- `bit1`: `quat_good` (derived: accuracy == 3)
+- `bit2`: `mag_suspect` (derived: accuracy <= 1)
+- `bits3..7`: reserved (`0` unless fallback behavior sets non-zero in future)
+
+Quaternion sample behavior
+- BNO quaternion sampling is rate-limited to 250 Hz in firmware.
+- If report rate > 250 Hz, report ID 2 retransmits latest cached quaternion between fresh sensor updates.
+
+Report ID 3 (OUTPUT, 4-byte payload)
 - Payload bytes: `[cmd, sr_lo, sr_hi, flags]`
 - `cmd`:
-  - `0x01` START (sets `running=True` and applies sample rate)
+  - `0x01` START (sets `running=True`, applies sample rate)
   - `0x02` STOP  (sets `running=False`)
-- `sr_lo/sr_hi`: sample rate in Hz, `uint16` little-endian, clamped to `1..1000` (`0` maps to `500`)
-- `flags`: currently ignored by firmware
-- Host quirk: some tools prepend leading `0` report-id/dummy byte; firmware accepts both forms.
+- `sr_lo/sr_hi`: desired report rate, `uint16` little-endian, clamped to `1..1000` (`0` maps to `500`)
+- `flags`: currently ignored
 
-Status bit logic (`uint16` at bytes `24..25`)
-- `bit0` `fully_ready`: `1` only when `boot_ok` and bits `3..9` are all `1`
-- `bit1` `boot_ok`: `1` after firmware init (set by device)
-- `bit2` `running`: `1` while streaming is running
-- `bit3` `handset_connected`: `1` when `pcf_ok or bno_ok`
-- `bit4` `pedal_connected`: `1` when pedal sense indicates connected
-- `bit5` `peripherals_all_ok`: `1` when `lsm6_ok and nau_ok and bno_ok and pcf_ok`
-- `bit6` `lsm6_ok`: `1` when LSM6DSOX present/healthy
-- `bit7` `nau_ok`: `1` when NAU7802 present/healthy
-- `bit8` `bno_ok`: `1` when BNO085 present/healthy
-- `bit9` `pcf_ok`: `1` when PCF8574 present/healthy
-- `bits10..15`: currently unused (`0`)
+Runtime transmit scheduling
+- Report ID 1 target rate: commanded `report_hz` (1..1000 Hz)
+- Report ID 2 target rate: `min(report_hz, 250)`
+- Both are attempted continuously while `running=True`.
 
-Quaternion stream behavior
-- HID report contains quaternion as `int16 x4` in order `(w, x, y, z)`.
-- Quaternion source is BNO085 fused rotation vector (gyro + accel + magnetometer path), configured at 250 Hz.
-- If HID sample rate is set above 250 Hz, firmware retransmits the last sampled quaternion until a new 250 Hz sample is available.
+Status bits (used in Report ID 1 `buttons24<7:0>`)
+- `bit0`: `fully_ready`
+- `bit1`: `boot_ok`
+- `bit2`: `running`
+- `bit3`: `handset_connected`
+- `bit4`: `pedal_connected`
+- `bit5`: `peripherals_all_ok`
+- `bit6`: `lsm6_ok`
+- `bit7`: `nau_ok`
 
-ADC stream behavior
-- Four onboard ADC channels are enabled at max native resolution via CircuitPython `analogio.AnalogIn`.
-- Mapping into HID fields:
-  - `knob0` <- `A0`
-  - `knob1` <- `A1`
-  - `slider0` <- `A2`
-  - `slider1` <- `A3`
-- ADC values are sampled on each HID report tick, so effective ADC sample rate equals current output SR.
+HID test command examples (`hidapitester.exe`)
+- Open by joystick usage:
+  - `--usagePage 1 --usage 4`
+- Send START with report ID 3, 1000 Hz (`1000 = 0x03E8 => 232,3`):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,1,232,3,0`
+- Send START with report ID 3, 250 Hz (`250 = 0x00FA => 250,0`):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,1,250,0,0`
+- Send STOP:
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,2,0,0,0`
+- Read report ID 1 stream (tool-dependent formatting):
+  - expected payload bytes: `16` (+ optional report-id byte)
+- Read report ID 2 stream:
+  - expected payload bytes: `10` (+ optional report-id byte)
+
+OUT command quick recipes (various rates)
+- Packet format with report ID: `3,cmd,sr_lo,sr_hi,flags`
+
+- START 4 Hz (`0x0004 => 4,0`):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,1,4,0,0`
+- START 250 Hz (`0x00FA => 250,0`):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,1,250,0,0`
+- START 1000 Hz (`0x03E8 => 232,3`):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,1,232,3,0`
+- START default 500 Hz using `sr=0` (`0x0000 => 0,0`):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,1,0,0,0`
+
+- STOP streaming:
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 5 --send-output 3,2,0,0,0`
+
+Receive IN stream
+- One read (buffer 17 catches report ID + 16-byte payload from report 1):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 17 --read-input --timeout 2000`
+- Continuous read (quiet mode):
+  - `hidapitester.exe --vidpid 239A:80F2 --usagePage 1 --usage 4 --open --length 17 --timeout 2000 --quiet --read-input-forever 0`
+- If your host returns report 2 frames, expected sizes are:
+  - report 1: `17` bytes total (`ID + 16`)
+  - report 2: `11` bytes total (`ID + 10`)
 
 Troubleshooting
-- No serial prints: confirm CDC enabled in `boot.py` and reopen Serial Monitor after reset.
-- No HID device: confirm usage page/usage in `boot.py` are `0xFF00/0x0001`.
-- START works but no stream: verify `running=True` print and then run `--read-input`.
-- STOP does not halt stream: check `if running: dev.send_report(in_buf)` in `code.py`.
-- Buttons not changing: verify PCF8574 present at `0x20` and pedal/torso wiring are active-low.
-- Load stuck at zero: verify NAU init prints and that `update_nau_load16()` is being called each loop.
+- No serial prints: confirm CDC enabled in `boot.py` and reopen serial monitor after reset.
+- No HID device: verify joystick top-level usage (`0x01/0x04`) in `boot.py`.
+- No stream after START: confirm command is sent to report ID `3` and `running=True` is printed.
+- Report ID 2 stale values: expected when host rate > 250 Hz (sensor update limit).
+- Buttons not changing: verify PCF8574 at `0x20` and torso/pedal active-low wiring.
+- Load stuck at zero: verify NAU7802 initialization and runtime availability checks.
